@@ -1,17 +1,12 @@
 import os
-import secrets
 from typing import List, Optional, Dict, Any, Tuple
 
-from fastapi import FastAPI, HTTPException, Query, Body, Depends, status, Request
+from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.services.places_client import PlacesClient, Center
 from app.models.schemas import (
@@ -67,42 +62,7 @@ def _parse_address_parts(addr: str) -> Dict[str, str]:
         out["street"] = addr
     return out
 
-# Basic Auth Configuration
-USERNAME = os.getenv("AUTH_USERNAME", "admin")
-PASSWORD = os.getenv("AUTH_PASSWORD", "changeme123")  # Change this in production!
-
-security = HTTPBasic()
-
-def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
-    correct_username = secrets.compare_digest(credentials.username, USERNAME)
-    correct_password = secrets.compare_digest(credentials.password, PASSWORD)
-    if not (correct_username and correct_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-    return credentials.username
-
 app = FastAPI(title="Fleet Prospect Finder - MVP (Places API)")
-
-# Security middleware
-app.add_middleware(HTTPSRedirectMiddleware)
-app.add_middleware(
-    TrustedHostMiddleware,
-    allowed_hosts=["*"],  # Replace with your actual domains in production
-)
-
-# Security headers middleware
-@app.middleware("http")
-async def add_security_headers(request: Request, call_next):
-    response = await call_next(request)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-XSS-Protection"] = "1; mode=block"
-    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    response.headers["Content-Security-Policy"] = "default-src 'self'"
-    return response
 
 # CORS for local dev and typical ports
 app.add_middleware(
@@ -128,19 +88,41 @@ def reload_categories() -> None:
     CATEGORY_PACKS = packs
     CATEGORY_PACKS_BY_KEY = {p.key: p for p in packs}
 
-# Minimal field mask - only what we need for basic business info
+# Minimal field mask per PRD (plus pureServiceAreaBusiness when present)
 FIELD_MASK = (
     "places.id,"
-    "places.displayName.text,"  # Business name
-    "places.formattedAddress,"  # Full address
-    "places.location.latitude,"  # Location coordinates
-    "places.location.longitude,"
-    "places.primaryType"  # Business category
+    "places.displayName,"
+    "places.formattedAddress,"
+    "places.location,"
+    "places.types,"
+    "places.primaryType,"
+    "places.businessStatus,"
+    "places.googleMapsUri,"
+    "places.rating,"
+    "places.userRatingCount,"
+    "places.pureServiceAreaBusiness"
 )
 
 # In-memory cache for search responses (20 minute TTL)
 _CACHE_TTL_SECONDS = 20 * 60
 _SEARCH_CACHE: Dict[Tuple[float, float, int, Tuple[str, ...], bool], Tuple[float, Dict[str, Any]]] = {}
+
+
+def _encode_next_token(origin: str, upstream_token: str) -> str:
+    """Prefix-origin encode to avoid double-tries. origin in {'n','t'} for nearby/text."""
+    if origin not in {"n", "t"}:
+        raise ValueError("invalid origin")
+    return f"{origin}:{upstream_token}"
+
+
+def _decode_next_token(token: str) -> Tuple[str, str]:
+    """Return (origin, upstream_token). If no prefix, raise ValueError."""
+    if not token or ":" not in token:
+        raise ValueError("Invalid nextPageToken format")
+    origin, rest = token.split(":", 1)
+    if origin not in {"n", "t"} or not rest:
+        raise ValueError("Invalid nextPageToken format")
+    return origin, rest
 
 def _build_cache_key(center_lat: float, center_lng: float, radius_meters: int, categories: List[str], high_recall: bool) -> Tuple[float, float, int, Tuple[str, ...], bool]:
     # Round lat/lng to avoid overly granular keys; 5 decimals ~1.1 meters
@@ -207,67 +189,106 @@ async def search_places(req: SearchRequest) -> SearchResponse:
     cached = _cache_get(cache_key)
     if cached is not None:
         # Compose response using cached payload
-        return SearchResponse(
+        cached_resp = SearchResponse(
             results=cached.get("results", []),
             nextPageToken=cached.get("nextPageToken"),
             centerLat=center_lat,
             centerLng=center_lng,
         )
+        return JSONResponse(content=cached_resp.model_dump(), headers={"X-Cache": "HIT"})
 
-    # Execute per selected category pack to tag results with pack labels
+    # Consolidated execution: single Nearby and single Text where applicable
     results_by_id: Dict[str, PlaceLite] = {}
-    # Store upstream pagination tokens together with their originating pack label
-    paginate_queue: List[tuple[str, str]] = []  # (next_page_token, pack_label)
-
     max_results = req.maxResults or 60
 
+    # Aggregate types and keywords from selected packs
+    all_included_types: List[str] = []
+    all_keywords: List[str] = []
+    pack_labels_by_type: Dict[str, List[str]] = {}
+    pack_labels = []
     for key in req.categories:
         pack = CATEGORY_PACKS_BY_KEY.get(key)
         if not pack:
             raise HTTPException(status_code=400, detail=f"Unknown category pack: {key}")
+        pack_labels.append(pack.label)
+        for t in (pack.includedTypes or []):
+            all_included_types.append(t)
+            pack_labels_by_type.setdefault(t, []).append(pack.label)
+        for kw in (pack.keywords or []):
+            all_keywords.append(kw)
 
-        pack_label = pack.label
+    # Deduplicate
+    all_included_types = sorted(list({t for t in all_included_types}))
+    all_keywords = sorted(list({k for k in all_keywords}))
 
-        # Nearby: use pack's includedTypes if any
-        if pack.includedTypes:
-            nearby_resp = await client.search_nearby(
-                center=center,
-                radius_meters=req.radiusMeters,
-                included_types=pack.includedTypes,
-                max_result_count=min(20, max_results),
-            )
-            for r in nearby_resp.results:
-                existing = results_by_id.get(r.placeId)
-                if existing:
-                    if pack_label not in (existing.categories or []):
-                        existing.categories.append(pack_label)
-                else:
-                    r.categories = [pack_label]
-                    results_by_id[r.placeId] = r
-            if nearby_resp.next_page_token:
-                paginate_queue.append((nearby_resp.next_page_token, pack_label))
+    next_nearby_token: Optional[str] = None
+    next_text_token: Optional[str] = None
 
-        # Text Search: use pack's keywords if any
-        if pack.keywords:
-            seg = " OR ".join(pack.keywords)
-            text_resp = await client.search_text(
-                text_query=seg,
-                center=center,
-                radius_meters=req.radiusMeters,
-                max_result_count=min(20, max_results),
-            )
-            for r in text_resp.results:
-                existing = results_by_id.get(r.placeId)
-                if existing:
-                    if pack_label not in (existing.categories or []):
-                        existing.categories.append(pack_label)
-                else:
-                    r.categories = [pack_label]
-                    results_by_id[r.placeId] = r
-            if text_resp.next_page_token:
-                paginate_queue.append((text_resp.next_page_token, pack_label))
+    # Nearby combined
+    if all_included_types:
+        nearby_resp = await client.search_nearby(
+            center=center,
+            radius_meters=req.radiusMeters,
+            included_types=all_included_types,
+            max_result_count=min(15, max_results),
+        )
+        for r in nearby_resp.results:
+            existing = results_by_id.get(r.placeId)
+            # Tag packs by matching primary type to includedTypes mapping; fallback add all selected if unsure
+            labels = []
+            if r.primaryType and r.primaryType in pack_labels_by_type:
+                labels = pack_labels_by_type.get(r.primaryType, [])
+            elif r.types:
+                # If any of result types are in our includedTypes mapping, collect their labels
+                lbl_set = set()
+                for tp in r.types:
+                    for lbl in pack_labels_by_type.get(tp, []):
+                        lbl_set.add(lbl)
+                labels = sorted(lbl_set)
+            else:
+                labels = []
+            if existing:
+                for lbl in labels:
+                    if lbl not in (existing.categories or []):
+                        existing.categories.append(lbl)
+            else:
+                r.categories = labels
+                results_by_id[r.placeId] = r
+        if nearby_resp.next_page_token:
+            next_nearby_token = nearby_resp.next_page_token
 
-    # Recall boost: If auto-repair related packs are selected and highRecall is on, run an extra targeted text search and merge
+    # Text combined
+    if all_keywords:
+        seg = " OR ".join(all_keywords)
+        text_resp = await client.search_text(
+            text_query=seg,
+            center=center,
+            radius_meters=req.radiusMeters,
+            max_result_count=min(15, max_results),
+        )
+        for r in text_resp.results:
+            existing = results_by_id.get(r.placeId)
+            # Heuristic tagging: if primaryType maps to any includedTypes we set labels, otherwise leave empty.
+            labels = []
+            if r.primaryType and r.primaryType in pack_labels_by_type:
+                labels = pack_labels_by_type.get(r.primaryType, [])
+            elif r.types:
+                lbl_set = set()
+                for tp in r.types:
+                    for lbl in pack_labels_by_type.get(tp, []):
+                        lbl_set.add(lbl)
+                labels = sorted(lbl_set)
+            if existing:
+                for lbl in labels:
+                    if lbl not in (existing.categories or []):
+                        existing.categories.append(lbl)
+            else:
+                r.categories = labels
+                results_by_id[r.placeId] = r
+        if text_resp.next_page_token:
+            next_text_token = text_resp.next_page_token
+
+    # Recall boost remains optional; only run if explicitly requested
     try:
         AUTO_RECALL_KEYS = {
             "auto_traditional",  # general auto repair
@@ -293,7 +314,7 @@ async def search_places(req: SearchRequest) -> SearchResponse:
                 text_query=boost_query,
                 center=center,
                 radius_meters=req.radiusMeters,
-                max_result_count=min(20, max_results),
+                max_result_count=min(10, max_results),
             )
             for r in boost_resp.results:
                 existing = results_by_id.get(r.placeId)
@@ -304,37 +325,12 @@ async def search_places(req: SearchRequest) -> SearchResponse:
                 else:
                     r.categories = ["TRADITIONAL AUTO"]
                     results_by_id[r.placeId] = r
-            if boost_resp.next_page_token:
-                paginate_queue.append((boost_resp.next_page_token, "TRADITIONAL AUTO"))
+            # For simplicity, do not propagate boost pagination to reduce costs
     except Exception:
         # Boost is best-effort; do not fail the request if it errors
         pass
 
-    # High-recall pagination: fetch additional pages round-robin across all queued next_page_tokens
-    if req.highRecall and paginate_queue:
-        try:
-            # Round-robin until max_results or tokens exhausted
-            idx = 0
-            while len(results_by_id) < max_results and paginate_queue:
-                token, label = paginate_queue.pop(0)
-                try:
-                    page = await client.fetch_next_page(next_page_token=token)
-                except Exception:
-                    continue
-                for r in page.results:
-                    existing = results_by_id.get(r.placeId)
-                    if existing:
-                        if label and label not in (existing.categories or []):
-                            existing.categories.append(label)
-                    else:
-                        r.categories = [label] if label else []
-                        results_by_id[r.placeId] = r
-                if page.next_page_token:
-                    paginate_queue.append((page.next_page_token, label))
-                idx = (idx + 1) % (len(paginate_queue) or 1)
-        except Exception:
-            # Don't fail the request if pagination fails
-            pass
+    # No server-side auto-pagination; leave to client 'Load More'
 
     merged_list = list(results_by_id.values())
 
@@ -355,18 +351,30 @@ async def search_places(req: SearchRequest) -> SearchResponse:
     # Truncate to max_results
     filtered = filtered[:max_results]
 
-    # For compatibility, still expose the first available token if any
-    next_token = paginate_queue[0][0] if paginate_queue else None
+    # Expose a composite nextPageToken encoding origin to prevent double-tries. Prefer Nearby token, else Text token.
+    next_token = None
+    if next_nearby_token:
+        next_token = _encode_next_token("n", next_nearby_token)
+    elif next_text_token:
+        next_token = _encode_next_token("t", next_text_token)
 
     resp = SearchResponse(results=filtered, nextPageToken=next_token, centerLat=center_lat, centerLng=center_lng)
 
     # Store in cache
     _cache_set(cache_key, {"results": resp.results, "nextPageToken": resp.nextPageToken})
 
-    return resp
+    headers = {
+        "X-Cache": "MISS",
+        "X-Places-Search-Nearby": str(client.metrics.get("search_nearby_calls", 0)),
+        "X-Places-Search-Text": str(client.metrics.get("search_text_calls", 0)),
+        "X-Places-Details": str(client.metrics.get("details_calls", 0)),
+        "X-Places-Center-Cache-Hits": str(client.metrics.get("center_cache_hits", 0)),
+        "X-Places-Center-Cache-Misses": str(client.metrics.get("center_cache_misses", 0)),
+    }
+    return JSONResponse(content=resp.model_dump(), headers=headers)
 
 @app.get("/search/places/next", response_model=SearchResponse)
-async def search_places_next(token: str = Query(..., description="Upstream Places API nextPageToken")) -> SearchResponse:
+async def search_places_next(token: str = Query(..., description="Composite nextPageToken returned from /search/places")) -> SearchResponse:
     reload_categories()
     if not PLACES_API_KEY:
         raise HTTPException(status_code=500, detail="PLACES_API_KEY not configured")
@@ -374,12 +382,21 @@ async def search_places_next(token: str = Query(..., description="Upstream Place
     client = PlacesClient(api_key=PLACES_API_KEY, field_mask=FIELD_MASK)
 
     try:
-        resp = await client.fetch_next_page(next_page_token=token)
+        origin, upstream = _decode_next_token(token)
+        origin_name = "text" if origin == "t" else "nearby"
+        resp = await client.fetch_next_page(origin=origin_name, next_page_token=upstream)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # No filtering or merging on next page alone; just pass through and let client apply filters client-side if needed
-    return SearchResponse(results=resp.results, nextPageToken=resp.next_page_token)
+    # Return composite token again if present
+    composite = None
+    if resp.next_page_token:
+        composite = _encode_next_token("t" if origin_name == "text" else "n", resp.next_page_token)
+    headers = {
+        "X-Places-Search-Nearby": str(client.metrics.get("search_nearby_calls", 0)),
+        "X-Places-Search-Text": str(client.metrics.get("search_text_calls", 0)),
+    }
+    return JSONResponse(content=SearchResponse(results=resp.results, nextPageToken=composite).model_dump(), headers=headers)
 
 # New: Categories endpoint for frontend selector
 @app.get("/categories")
@@ -451,45 +468,41 @@ async def search_places_csv(
     headers = {"Content-Disposition": "attachment; filename=places_export.csv"}
     return StreamingResponse(output, media_type="text/csv", headers=headers)
 
+# New: Place details enrichment (phone, website) for a list of placeIds
+@app.post("/places/details")
+async def places_details(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not PLACES_API_KEY:
+        raise HTTPException(status_code=500, detail="PLACES_API_KEY not configured")
+    ids = payload.get("placeIds") or []
+    if not isinstance(ids, list) or not ids:
+        raise HTTPException(status_code=400, detail="placeIds array required")
+    # Cap to 50 to limit cost/time
+    ids = ids[:50]
+    client = PlacesClient(api_key=PLACES_API_KEY, field_mask=FIELD_MASK)
+
+    out: Dict[str, Any] = {}
+    for pid in ids:
+        try:
+            data = await client.get_place_details(pid)
+            out[pid] = {
+                "phone": data.get("nationalPhoneNumber") or data.get("internationalPhoneNumber"),
+                "website": data.get("websiteUri"),
+            }
+        except Exception:
+            out[pid] = {"phone": None, "website": None}
+    headers = {
+        "X-Places-Details": str(client.metrics.get("details_calls", 0))
+    }
+    return JSONResponse(content={"details": out}, headers=headers)
+
 # Static frontend serving (app/web)
 WEB_DIR = os.path.join(os.path.dirname(__file__), "web")
 if os.path.isdir(WEB_DIR):
     app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 
-# Root endpoint with authentication
-@app.get("/", response_class=HTMLResponse)
-async def serve_index(username: str = Depends(verify_credentials)):
-    return FileResponse(os.path.join(WEB_DIR, "index.html"))
-
-# Protect the existing endpoints by adding dependencies
-@app.post("/search/places")
-async def protected_search_places(
-    req: SearchRequest, 
-    username: str = Depends(verify_credentials)
-):
-    return await search_places(req)
-
-@app.get("/search/next")
-async def protected_search_places_next(
-    token: str = Query(..., description="Upstream Places API nextPageToken"),
-    username: str = Depends(verify_credentials)
-):
-    return await search_places_next(token)
-
-@app.get("/api/categories")
-async def protected_get_categories(username: str = Depends(verify_credentials)):
-    return await get_categories()
-
-@app.post("/export/csv")
-async def protected_search_places_csv(
-    req: SearchRequest = Body(...),
-    filterPrimaryTypes: Optional[List[str]] = Query(None),
-    username: str = Depends(verify_credentials)
-):
-    return await search_places_csv(req, filterPrimaryTypes)
-
-# Health check endpoint (no auth required)
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
+@app.get("/")
+def serve_index():
+    index_path = os.path.join(WEB_DIR, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    return {"message": "Frontend not built. API is running."}

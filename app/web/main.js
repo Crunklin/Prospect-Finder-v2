@@ -13,118 +13,7 @@ function updatePackCount(){
 }
 // Simple frontend to drive the API and visualize results on a Leaflet map
 
-const apiBase = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' 
-  ? window.location.origin 
-  : 'https://prospect-finder-v2.onrender.com';
-
-// Cache configuration
-const CACHE_PREFIX = 'fleet_prospect_finder_';
-const CACHE_VERSION = 'v1';
-const CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
-
-/**
- * Generate a cache key from search parameters
- */
-function getCacheKey(params) {
-  // Create a stable string representation of the search parameters
-  const { center, radiusMeters, categories, highRecall } = params;
-  const centerKey = center.text || `${center.lat?.toFixed(6)},${center.lng?.toFixed(6)}`;
-  const categoriesKey = [...categories].sort().join(',');
-  return `${CACHE_PREFIX}${CACHE_VERSION}_${centerKey}_${radiusMeters}_${categoriesKey}_${!!highRecall}`;
-}
-
-/**
- * Save search results to cache
- */
-function saveToCache(key, data) {
-  try {
-    const cacheData = {
-      data,
-      timestamp: Date.now(),
-      ttl: CACHE_TTL
-    };
-    localStorage.setItem(key, JSON.stringify(cacheData));
-  } catch (e) {
-    console.warn('Failed to save to cache:', e);
-    // If local storage is full, clear old entries
-    if (e.name === 'QuotaExceededError') {
-      clearExpiredCache();
-      // Try again after clearing
-      try {
-        saveToCache(key, data);
-      } catch (e2) {
-        console.warn('Still cannot save to cache after cleanup:', e2);
-      }
-    }
-  }
-}
-
-/**
- * Get search results from cache
- */
-function getFromCache(key) {
-  try {
-    const cached = localStorage.getItem(key);
-    if (!cached) return null;
-    
-    const { data, timestamp, ttl } = JSON.parse(cached);
-    
-    // Check if cache is expired
-    if (Date.now() - timestamp > (ttl || CACHE_TTL)) {
-      // Cache expired, remove it
-      localStorage.removeItem(key);
-      return null;
-    }
-    
-    return data;
-  } catch (e) {
-    console.warn('Failed to read from cache:', e);
-    return null;
-  }
-}
-
-/**
- * Clear expired cache entries
- */
-function clearExpiredCache() {
-  const now = Date.now();
-  const keysToRemove = [];
-  
-  try {
-    // Find expired cache entries
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
-      if (key.startsWith(CACHE_PREFIX)) {
-        try {
-          const cached = localStorage.getItem(key);
-          if (cached) {
-            const { timestamp, ttl } = JSON.parse(cached);
-            if (now - timestamp > (ttl || CACHE_TTL)) {
-              keysToRemove.push(key);
-            }
-          }
-        } catch (e) {
-          // If we can't parse the cache entry, remove it
-          keysToRemove.push(key);
-        }
-      }
-    }
-    
-    // Remove expired entries
-    keysToRemove.forEach(key => localStorage.removeItem(key));
-    
-    if (keysToRemove.length > 0) {
-      console.log(`Cleared ${keysToRemove.length} expired cache entries`);
-    }
-  } catch (e) {
-    console.warn('Error clearing expired cache:', e);
-  }
-}
-
-// Clean up expired cache entries on page load
-if (typeof window !== 'undefined') {
-  window.addEventListener('load', clearExpiredCache);
-}
+const apiBase = window.location.origin;
 
 const els = {
   centerText: document.getElementById('centerText'),
@@ -134,7 +23,6 @@ const els = {
   catSelectAll: document.getElementById('catSelectAll'),
   catSelectNone: document.getElementById('catSelectNone'),
   searchBtn: document.getElementById('searchBtn'),
-  refreshBtn: document.getElementById('refreshBtn'),
   loadMoreBtn: document.getElementById('loadMoreBtn'),
   exportCsvBtn: document.getElementById('exportCsvBtn'),
   resultsList: document.getElementById('resultsList'),
@@ -160,6 +48,9 @@ const els = {
   densityToggleBtn: document.getElementById('densityToggleBtn'),
   highRecallToggle: document.getElementById('highRecallToggle'),
 };
+
+// Default high-recall to off to minimize API pagination costs
+if (els.highRecallToggle) els.highRecallToggle.checked = false;
 
 let map;
 let markersLayer;
@@ -727,21 +618,22 @@ function renderResults(list) {
   const bounds = [];
   const cLat = lastResponse?.centerLat;
   const cLng = lastResponse?.centerLng;
-  
-  if (!list.length) {
+  if (!list.length){
     const empty = document.createElement('div');
     empty.className = 'empty-state';
     empty.innerHTML = '<div class="icon">🔍</div><div>No businesses found matching your criteria</div>';
     els.resultsList.appendChild(empty);
     return;
   }
-  
   list.forEach((r, idx) => {
     const row = document.createElement('div');
     row.className = 'result-row';
-    
-    // Get category badges
+    const rawPhone = (r.phone || '').trim();
+    const phone = rawPhone ? `<a href="tel:${rawPhone.replace(/[^+\d]/g,'')}">${rawPhone}</a>` : '-';
+    const rawWebsite = (r.website || '').trim();
+    const website = rawWebsite ? `<a href="${rawWebsite}" target="_blank" rel="noopener">Visit Site</a>` : '-';
     const cat = getCategoryLabel(r);
+    // Build category badges: prefer pack labels from r.categories; fallback to primaryType mapping
     let badgesHTML = '';
     if (Array.isArray(r.categories) && r.categories.length > 0) {
       const labels = r.categories.slice(0, 4); // cap to 4 badges for space
@@ -749,18 +641,11 @@ function renderResults(list) {
     } else {
       badgesHTML = `<span class="badge ${cat.css}">${cat.label}</span>`;
     }
-    
-    // Calculate distance if we have coordinates
-    const distNum = (typeof r.lat === 'number' && typeof r.lng === 'number' && 
-                    typeof cLat === 'number' && typeof cLng === 'number')
+    const distNum = (typeof r.lat === 'number' && typeof r.lng === 'number' && typeof cLat === 'number' && typeof cLng === 'number')
       ? (haversineMiles(cLat, cLng, r.lat, r.lng))
       : null;
     const distMiles = distNum == null ? '' : (distNum.toFixed(1) + ' mi');
-    
-    // Parse address parts
     const ap = parseAddressParts(r.formattedAddress || '');
-    
-    // Create row with only essential information
     row.innerHTML = `
       <div class="cell name">${r.name || ''}</div>
       <div class="cell category"><span class="badges">${badgesHTML}</span></div>
@@ -768,83 +653,48 @@ function renderResults(list) {
       <div class="cell city">${ap.city || ''}</div>
       <div class="cell state">${ap.state || ''}</div>
       <div class="cell zip">${ap.zip || ''}</div>
+      <div class="cell phone">${phone}</div>
+      <div class="cell website">${website}</div>
       <div class="cell distance">${distMiles}</div>
     `;
-    
     els.resultsList.appendChild(row);
 
-    // Add marker to map
     if (typeof r.lat === 'number' && typeof r.lng === 'number') {
-      const popupContent = `
-        <strong>${r.name || ''}</strong><br>
-        ${ap.street || ''}<br>
-        ${ap.city ? ap.city + ', ' : ''}${ap.state || ''} ${ap.zip || ''}
-      `;
-      const m = L.marker([r.lat, r.lng]).bindPopup(popupContent);
+      const m = L.marker([r.lat, r.lng]).bindPopup(`<strong>${r.name || ''}</strong><br>${r.formattedAddress || ''}`);
       markersLayer.addLayer(m);
       bounds.push([r.lat, r.lng]);
     }
   });
 
-  // Adjust map view to show all markers
   if (bounds.length) {
     map.fitBounds(bounds, { padding: [20, 20] });
   }
 }
 
-async function doSearch(forceRefresh = false) {
+async function doSearch() {
   els.searchBtn.disabled = true;
   els.exportCsvBtn.disabled = true;
   els.loadMoreBtn.disabled = true;
-  
   try {
     const body = getRequestBody();
-    const cacheKey = getCacheKey(body);
-    
-    // Try to get results from cache if not forcing a refresh
-    let data = null;
-    if (!forceRefresh) {
-      data = getFromCache(cacheKey);
-      if (data) {
-        console.log('Using cached results for this search');
-      }
-    }
-    
-    // If no cached data or forcing refresh, fetch from API
-    if (!data) {
-      const res = await fetch(`${apiBase}/search/places`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      
-      if (!res.ok) throw new Error(`Search failed: ${res.status}`);
-      
-      data = await res.json();
-      
-      // Cache the results for future use
-      if (cacheKey) {
-        saveToCache(cacheKey, data);
-      }
-    }
-    
-    // Process the results (whether from cache or API)
+    const res = await fetch(`${apiBase}/search/places`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`Search failed: ${res.status}`);
+    const data = await res.json();
     lastResponse = data;
     nextPageToken = data.nextPageToken || null;
-    
-    // Update the UI with the results
     buildTypeChips(lastResponse.results || []);
     buildPackChips(lastResponse.results || []);
     const filtered = clientFilter(lastResponse.results || []);
     const sorted = sortList(filtered);
     renderResults(sorted);
-    
-    // Enable/disable UI elements
     els.exportCsvBtn.disabled = false;
     els.loadMoreBtn.disabled = !nextPageToken;
-    
   } catch (err) {
-    console.error('Search error:', err);
+    console.error(err);
     alert('Search failed. See console for details.');
   } finally {
     els.searchBtn.disabled = false;
@@ -859,18 +709,14 @@ async function loadMore() {
     if (!res.ok) throw new Error(`Load more failed: ${res.status}`);
     const data = await res.json();
     nextPageToken = data.nextPageToken || null;
-    
     // Append results to lastResponse
     const existing = lastResponse?.results || [];
     const mergedById = new Map();
     for (const r of existing) mergedById.set(r.placeId, r);
     for (const r of (data.results || [])) mergedById.set(r.placeId, r);
     const merged = Array.from(mergedById.values());
-    
-    // Update lastResponse with merged results
     lastResponse.results = merged;
-    
-    // Rebuild filters and render
+    // Rebuild type chips including any new primary types
     buildTypeChips(lastResponse.results || []);
     buildPackChips(lastResponse.results || []);
     const filtered = clientFilter(merged);
@@ -881,6 +727,30 @@ async function loadMore() {
     alert('Load more failed. See console for details.');
   } finally {
     els.loadMoreBtn.disabled = !nextPageToken;
+  }
+}
+
+async function enrichDetails(items) {
+  const ids = (items || []).map(r => r.placeId).filter(Boolean);
+  if (!ids.length) return;
+  try {
+    const res = await fetch(`${apiBase}/places/details`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ placeIds: ids.slice(0, 50) }),
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    const details = data.details || {};
+    for (const item of items) {
+      const d = details[item.placeId];
+      if (d) {
+        item.phone = d.phone || item.phone;
+        item.website = d.website || item.website;
+      }
+    }
+  } catch (_) {
+    // ignore details errors
   }
 }
 
@@ -928,12 +798,7 @@ function toggleDrawMode() {
 }
 
 function wireEvents() {
-  if (els.searchBtn) els.searchBtn.addEventListener('click', () => doSearch());
-  
-  // Refresh button (force refresh)
-  if (els.refreshBtn) {
-    els.refreshBtn.addEventListener('click', () => doSearch(true));
-  }
+  if (els.searchBtn) els.searchBtn.addEventListener('click', doSearch);
   if (els.applyFiltersBtn) {
     els.applyFiltersBtn.addEventListener('click', () => {
       if (!lastResponse) return;
