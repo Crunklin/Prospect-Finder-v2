@@ -27,8 +27,6 @@ const els = {
   exportCsvBtn: document.getElementById('exportCsvBtn'),
   resultsList: document.getElementById('resultsList'),
   resultsCount: document.getElementById('resultsCount'),
-  minRating: document.getElementById('minRating'),
-  minReviews: document.getElementById('minReviews'),
   applyFiltersBtn: document.getElementById('applyFiltersBtn'),
   drawRadiusBtn: document.getElementById('drawRadiusBtn'),
   drawStatus: document.getElementById('drawStatus'),
@@ -48,9 +46,6 @@ const els = {
   densityToggleBtn: document.getElementById('densityToggleBtn'),
   highRecallToggle: document.getElementById('highRecallToggle'),
 };
-
-// Default high-recall to off to minimize API pagination costs
-if (els.highRecallToggle) els.highRecallToggle.checked = false;
 
 let map;
 let markersLayer;
@@ -73,7 +68,7 @@ let selectedTypes = new Set();
 let selectedPacks = new Set();
 
 // Sorting state
-let sortKey = 'name'; // 'name' | 'category' | 'address' | 'city' | 'state' | 'zip' | 'phone' | 'website' | 'distance'
+let sortKey = 'name'; // 'name' | 'category' | 'address' | 'city' | 'state' | 'zip' | 'phone' | 'distance'
 let sortDir = 'asc'; // 'asc' | 'desc'
 
 function initMap() {
@@ -183,8 +178,6 @@ function valueForSort(r, idx){
     case 'state': return (parseAddressParts(r.formattedAddress).state || '').toLowerCase();
     case 'zip': return (parseAddressParts(r.formattedAddress).zip || '').toLowerCase();
     case 'phone': return (r.phone || '').toLowerCase();
-    case 'website': return (r.website || '').toLowerCase();
-    case 'rating': return typeof r.rating === 'number' ? r.rating : -1;
     case 'distance': {
       const d = computeDistanceMiles(r);
       return d == null ? Number.POSITIVE_INFINITY : d;
@@ -575,8 +568,6 @@ function getRequestBody() {
 }
 
 function clientFilter(results) {
-  const minRating = els.minRating ? parseFloat(els.minRating.value) : NaN;
-  const minReviews = els.minReviews ? parseInt(els.minReviews.value, 10) : NaN;
   return results.filter(r => {
     // Filter by selected primary types if any selected (but if all types are selected, skip filter)
     if (selectedTypes.size > 0) {
@@ -603,8 +594,6 @@ function clientFilter(results) {
       const hasAny = packs.some(p => selectedPacks.has(p));
       if (!hasAny) return false;
     }
-    if (!isNaN(minRating) && (r.rating ?? 0) < minRating) return false;
-    if (!isNaN(minReviews) && (r.userRatingCount ?? 0) < minReviews) return false;
     return true;
   });
 }
@@ -630,8 +619,6 @@ function renderResults(list) {
     row.className = 'result-row';
     const rawPhone = (r.phone || '').trim();
     const phone = rawPhone ? `<a href="tel:${rawPhone.replace(/[^+\d]/g,'')}">${rawPhone}</a>` : '-';
-    const rawWebsite = (r.website || '').trim();
-    const website = rawWebsite ? `<a href="${rawWebsite}" target="_blank" rel="noopener">Visit Site</a>` : '-';
     const cat = getCategoryLabel(r);
     // Build category badges: prefer pack labels from r.categories; fallback to primaryType mapping
     let badgesHTML = '';
@@ -654,7 +641,6 @@ function renderResults(list) {
       <div class="cell state">${ap.state || ''}</div>
       <div class="cell zip">${ap.zip || ''}</div>
       <div class="cell phone">${phone}</div>
-      <div class="cell website">${website}</div>
       <div class="cell distance">${distMiles}</div>
     `;
     els.resultsList.appendChild(row);
@@ -686,6 +672,8 @@ async function doSearch() {
     const data = await res.json();
     lastResponse = data;
     nextPageToken = data.nextPageToken || null;
+    // Enrich with details (phone) then render
+    await enrichDetails(lastResponse.results || []);
     buildTypeChips(lastResponse.results || []);
     buildPackChips(lastResponse.results || []);
     const filtered = clientFilter(lastResponse.results || []);
@@ -715,6 +703,10 @@ async function loadMore() {
     for (const r of existing) mergedById.set(r.placeId, r);
     for (const r of (data.results || [])) mergedById.set(r.placeId, r);
     const merged = Array.from(mergedById.values());
+    // Enrich only newly added items without phone
+    const beforeIds = new Set(existing.map(r => r.placeId));
+    const newOnes = merged.filter(r => !beforeIds.has(r.placeId));
+    await enrichDetails(newOnes);
     lastResponse.results = merged;
     // Rebuild type chips including any new primary types
     buildTypeChips(lastResponse.results || []);
@@ -746,7 +738,6 @@ async function enrichDetails(items) {
       const d = details[item.placeId];
       if (d) {
         item.phone = d.phone || item.phone;
-        item.website = d.website || item.website;
       }
     }
   } catch (_) {

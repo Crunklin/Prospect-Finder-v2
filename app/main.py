@@ -1,9 +1,12 @@
 import os
+import json
+import sqlite3
+from threading import RLock
 from typing import List, Optional, Dict, Any, Tuple
 
 from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -18,6 +21,67 @@ from app.utils.categories import load_category_packs, CategoryPack
 from app.utils.filters import apply_residential_filter
 
 load_dotenv()
+
+# --- Disk cache (SQLite) setup ---
+_CACHE_DB_PATH = os.path.join(os.path.dirname(__file__), "cache.db")
+_DB_LOCK = RLock()
+
+def _ensure_cache_db() -> None:
+    with _DB_LOCK:
+        conn = sqlite3.connect(_CACHE_DB_PATH)
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cache_entries (
+                    ns TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    ts REAL NOT NULL,
+                    value TEXT NOT NULL,
+                    PRIMARY KEY (ns, key)
+                )
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+def _disk_cache_get(ns: str, key: str, ttl_seconds: int) -> Optional[Dict[str, Any]]:
+    import time
+    now = time.time()
+    with _DB_LOCK:
+        conn = sqlite3.connect(_CACHE_DB_PATH)
+        try:
+            cur = conn.execute("SELECT ts, value FROM cache_entries WHERE ns=? AND key=?", (ns, key))
+            row = cur.fetchone()
+            if not row:
+                return None
+            ts, value_json = row
+            if now - float(ts) > ttl_seconds:
+                # prune stale
+                conn.execute("DELETE FROM cache_entries WHERE ns=? AND key=?", (ns, key))
+                conn.commit()
+                return None
+            try:
+                return json.loads(value_json)
+            except Exception:
+                return None
+        finally:
+            conn.close()
+
+def _disk_cache_set(ns: str, key: str, value: Dict[str, Any]) -> None:
+    import time
+    with _DB_LOCK:
+        conn = sqlite3.connect(_CACHE_DB_PATH)
+        try:
+            conn.execute(
+                "REPLACE INTO cache_entries (ns, key, ts, value) VALUES (?, ?, ?, ?)",
+                (ns, key, time.time(), json.dumps(value))
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+_ensure_cache_db()
 
 
 def _haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -74,6 +138,7 @@ app.add_middleware(
 )
 
 PLACES_API_KEY = os.getenv("PLACES_API_KEY")
+COMBINED_MODE = os.getenv("COMBINED_MODE", "").strip().lower() in {"1","true","yes","on"}
 if not PLACES_API_KEY:
     # Don't crash app; raise on first use instead to make DX smooth
     pass
@@ -98,8 +163,6 @@ FIELD_MASK = (
     "places.primaryType,"
     "places.businessStatus,"
     "places.googleMapsUri,"
-    "places.rating,"
-    "places.userRatingCount,"
     "places.pureServiceAreaBusiness"
 )
 
@@ -107,22 +170,13 @@ FIELD_MASK = (
 _CACHE_TTL_SECONDS = 20 * 60
 _SEARCH_CACHE: Dict[Tuple[float, float, int, Tuple[str, ...], bool], Tuple[float, Dict[str, Any]]] = {}
 
+# In-memory cache for resolving center.text -> (lat,lng) (24 hour TTL)
+_CENTER_TTL_SECONDS = 24 * 60 * 60
+_CENTER_CACHE: Dict[str, Tuple[float, Dict[str, float]]] = {}
 
-def _encode_next_token(origin: str, upstream_token: str) -> str:
-    """Prefix-origin encode to avoid double-tries. origin in {'n','t'} for nearby/text."""
-    if origin not in {"n", "t"}:
-        raise ValueError("invalid origin")
-    return f"{origin}:{upstream_token}"
-
-
-def _decode_next_token(token: str) -> Tuple[str, str]:
-    """Return (origin, upstream_token). If no prefix, raise ValueError."""
-    if not token or ":" not in token:
-        raise ValueError("Invalid nextPageToken format")
-    origin, rest = token.split(":", 1)
-    if origin not in {"n", "t"} or not rest:
-        raise ValueError("Invalid nextPageToken format")
-    return origin, rest
+# In-memory cache for place details (phone) to avoid repeated paid lookups (7-day TTL)
+_DETAILS_TTL_SECONDS = 7 * 24 * 60 * 60
+_DETAILS_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
 def _build_cache_key(center_lat: float, center_lng: float, radius_meters: int, categories: List[str], high_recall: bool) -> Tuple[float, float, int, Tuple[str, ...], bool]:
     # Round lat/lng to avoid overly granular keys; 5 decimals ~1.1 meters
@@ -143,17 +197,74 @@ def _cache_get(key: Tuple[float, float, int, Tuple[str, ...], bool]) -> Optional
     for k in stale:
         _SEARCH_CACHE.pop(k, None)
     entry = _SEARCH_CACHE.get(key)
-    if not entry:
-        return None
-    ts, val = entry
-    if now - ts > _CACHE_TTL_SECONDS:
+    if entry:
+        ts, val = entry
+        if now - ts <= _CACHE_TTL_SECONDS:
+            return val
         _SEARCH_CACHE.pop(key, None)
-        return None
-    return val
+    # Fallback to disk cache
+    disk_key = json.dumps({
+        "lat": key[0], "lng": key[1], "radius": key[2], "cats": list(key[3]), "hr": key[4]
+    }, sort_keys=True)
+    disk_val = _disk_cache_get("search", disk_key, _CACHE_TTL_SECONDS)
+    if disk_val is not None:
+        return disk_val
+    return None
 
 def _cache_set(key: Tuple[float, float, int, Tuple[str, ...], bool], value: Dict[str, Any]) -> None:
     import time
     _SEARCH_CACHE[key] = (time.time(), value)
+    # Write-through to disk
+    disk_key = json.dumps({
+        "lat": key[0], "lng": key[1], "radius": key[2], "cats": list(key[3]), "hr": key[4]
+    }, sort_keys=True)
+    _disk_cache_set("search", disk_key, value)
+
+def _center_cache_get(text: str) -> Optional[Dict[str, float]]:
+    import time
+    now = time.time()
+    key_norm = text.strip().lower()
+    entry = _CENTER_CACHE.get(key_norm)
+    if not entry:
+        # Try disk cache
+        disk_val = _disk_cache_get("center", key_norm, _CENTER_TTL_SECONDS)
+        if disk_val and "latitude" in disk_val and "longitude" in disk_val:
+            return disk_val
+        return None
+    ts, val = entry
+    if now - ts > _CENTER_TTL_SECONDS:
+        _CENTER_CACHE.pop(key_norm, None)
+        # Also remove from disk
+        return None
+    return val
+
+def _center_cache_set(text: str, lat: float, lng: float) -> None:
+    import time
+    key = text.strip().lower()
+    val = {"latitude": lat, "longitude": lng}
+    _CENTER_CACHE[key] = (time.time(), val)
+    _disk_cache_set("center", key, val)
+
+def _details_cache_get(place_id: str) -> Optional[Dict[str, Any]]:
+    import time
+    now = time.time()
+    entry = _DETAILS_CACHE.get(place_id)
+    if not entry:
+        # Try disk cache
+        disk_val = _disk_cache_get("details", place_id, _DETAILS_TTL_SECONDS)
+        if disk_val:
+            return disk_val
+        return None
+    ts, val = entry
+    if now - ts > _DETAILS_TTL_SECONDS:
+        _DETAILS_CACHE.pop(place_id, None)
+        return None
+    return val
+
+def _details_cache_set(place_id: str, data: Dict[str, Any]) -> None:
+    import time
+    _DETAILS_CACHE[place_id] = (time.time(), data)
+    _disk_cache_set("details", place_id, data)
 
 @app.get("/health")
 def health() -> Dict[str, str]:
@@ -177,10 +288,19 @@ async def search_places(req: SearchRequest) -> SearchResponse:
     else:
         raise HTTPException(status_code=400, detail="Invalid center: provide either text or lat/lng")
 
-    # Resolve to numeric coordinates for strict radius filtering
+    # Resolve to numeric coordinates for strict radius filtering (with cache for center.text)
     try:
-        center_geo = await client.resolve_center(center)
-        center_lat, center_lng = center_geo["latitude"], center_geo["longitude"]
+        if center.text:
+            cached_center = _center_cache_get(center.text)
+            if cached_center:
+                center_lat, center_lng = cached_center["latitude"], cached_center["longitude"]
+            else:
+                center_geo = await client.resolve_center(center)
+                center_lat, center_lng = center_geo["latitude"], center_geo["longitude"]
+                _center_cache_set(center.text, center_lat, center_lng)
+        else:
+            center_geo = await client.resolve_center(center)
+            center_lat, center_lng = center_geo["latitude"], center_geo["longitude"]
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to resolve center: {e}")
 
@@ -189,106 +309,150 @@ async def search_places(req: SearchRequest) -> SearchResponse:
     cached = _cache_get(cache_key)
     if cached is not None:
         # Compose response using cached payload
-        cached_resp = SearchResponse(
+        return SearchResponse(
             results=cached.get("results", []),
             nextPageToken=cached.get("nextPageToken"),
             centerLat=center_lat,
             centerLng=center_lng,
         )
-        return JSONResponse(content=cached_resp.model_dump(), headers={"X-Cache": "HIT"})
 
-    # Consolidated execution: single Nearby and single Text where applicable
+    # Execute search
     results_by_id: Dict[str, PlaceLite] = {}
+    paginate_queue: List[tuple[str, str]] = []  # (next_page_token, pack_label or "")
+
     max_results = req.maxResults or 60
 
-    # Aggregate types and keywords from selected packs
-    all_included_types: List[str] = []
-    all_keywords: List[str] = []
-    pack_labels_by_type: Dict[str, List[str]] = {}
-    pack_labels = []
+    def _label_by_types(pl: PlaceLite, packs: List[CategoryPack]) -> List[str]:
+        labels: List[str] = []
+        ptype = (pl.primaryType or "").lower()
+        types_set = set((pl.types or []))
+        for pk in packs:
+            inc = [t.lower() for t in (pk.includedTypes or [])]
+            if not inc:
+                continue
+            if ptype and ptype in inc:
+                labels.append(pk.label)
+                continue
+            if any((t.lower() in inc) for t in types_set):
+                labels.append(pk.label)
+        return labels
+
+    selected_packs: List[CategoryPack] = []
     for key in req.categories:
         pack = CATEGORY_PACKS_BY_KEY.get(key)
         if not pack:
             raise HTTPException(status_code=400, detail=f"Unknown category pack: {key}")
-        pack_labels.append(pack.label)
-        for t in (pack.includedTypes or []):
-            all_included_types.append(t)
-            pack_labels_by_type.setdefault(t, []).append(pack.label)
-        for kw in (pack.keywords or []):
-            all_keywords.append(kw)
+        selected_packs.append(pack)
 
-    # Deduplicate
-    all_included_types = sorted(list({t for t in all_included_types}))
-    all_keywords = sorted(list({k for k in all_keywords}))
+    if COMBINED_MODE:
+        # Combined Nearby: union of includedTypes
+        combined_types = sorted({t for p in selected_packs for t in (p.includedTypes or [])})
+        if combined_types:
+            # If too many, shard into small batches to remain specific
+            batch_size = 12
+            for i in range(0, len(combined_types), batch_size):
+                batch = combined_types[i:i+batch_size]
+                nearby_resp = await client.search_nearby(
+                    center=center,
+                    radius_meters=req.radiusMeters,
+                    included_types=batch,
+                    max_result_count=min(20, max_results),
+                )
+                for r in nearby_resp.results:
+                    existing = results_by_id.get(r.placeId)
+                    labels = _label_by_types(r, selected_packs)
+                    if existing:
+                        for lbl in labels:
+                            if lbl not in (existing.categories or []):
+                                existing.categories.append(lbl)
+                    else:
+                        r.categories = labels
+                        results_by_id[r.placeId] = r
+                if nearby_resp.next_page_token:
+                    paginate_queue.append((nearby_resp.next_page_token, ""))
 
-    next_nearby_token: Optional[str] = None
-    next_text_token: Optional[str] = None
+        # Combined Text: merged OR query, sharded by length
+        combined_keywords = sorted({kw for p in selected_packs for kw in (p.keywords or [])})
+        if combined_keywords:
+            # Build batches under a conservative length budget
+            cur_batch: List[str] = []
+            cur_len = 0
+            batches: List[str] = []
+            for kw in combined_keywords:
+                seg = (" OR " if cur_batch else "") + kw
+                if cur_len + len(seg) > 512:  # conservative cap
+                    if cur_batch:
+                        batches.append(" OR ".join(cur_batch))
+                    cur_batch = [kw]
+                    cur_len = len(kw)
+                else:
+                    cur_batch.append(kw)
+                    cur_len += len(seg)
+            if cur_batch:
+                batches.append(" OR ".join(cur_batch))
 
-    # Nearby combined
-    if all_included_types:
-        nearby_resp = await client.search_nearby(
-            center=center,
-            radius_meters=req.radiusMeters,
-            included_types=all_included_types,
-            max_result_count=min(15, max_results),
-        )
-        for r in nearby_resp.results:
-            existing = results_by_id.get(r.placeId)
-            # Tag packs by matching primary type to includedTypes mapping; fallback add all selected if unsure
-            labels = []
-            if r.primaryType and r.primaryType in pack_labels_by_type:
-                labels = pack_labels_by_type.get(r.primaryType, [])
-            elif r.types:
-                # If any of result types are in our includedTypes mapping, collect their labels
-                lbl_set = set()
-                for tp in r.types:
-                    for lbl in pack_labels_by_type.get(tp, []):
-                        lbl_set.add(lbl)
-                labels = sorted(lbl_set)
-            else:
-                labels = []
-            if existing:
-                for lbl in labels:
-                    if lbl not in (existing.categories or []):
-                        existing.categories.append(lbl)
-            else:
-                r.categories = labels
-                results_by_id[r.placeId] = r
-        if nearby_resp.next_page_token:
-            next_nearby_token = nearby_resp.next_page_token
+            for seg in batches:
+                text_resp = await client.search_text(
+                    text_query=seg,
+                    center=center,
+                    radius_meters=req.radiusMeters,
+                    max_result_count=min(20, max_results),
+                )
+                for r in text_resp.results:
+                    existing = results_by_id.get(r.placeId)
+                    labels = _label_by_types(r, selected_packs)
+                    if existing:
+                        for lbl in labels:
+                            if lbl not in (existing.categories or []):
+                                existing.categories.append(lbl)
+                    else:
+                        r.categories = labels
+                        results_by_id[r.placeId] = r
+                if text_resp.next_page_token:
+                    paginate_queue.append((text_resp.next_page_token, ""))
+    else:
+        # Original per-pack behavior
+        for key in req.categories:
+            pack = CATEGORY_PACKS_BY_KEY.get(key)
+            pack_label = pack.label
+            if pack.includedTypes:
+                nearby_resp = await client.search_nearby(
+                    center=center,
+                    radius_meters=req.radiusMeters,
+                    included_types=pack.includedTypes,
+                    max_result_count=min(20, max_results),
+                )
+                for r in nearby_resp.results:
+                    existing = results_by_id.get(r.placeId)
+                    if existing:
+                        if pack_label not in (existing.categories or []):
+                            existing.categories.append(pack_label)
+                    else:
+                        r.categories = [pack_label]
+                        results_by_id[r.placeId] = r
+                if nearby_resp.next_page_token:
+                    paginate_queue.append((nearby_resp.next_page_token, pack_label))
 
-    # Text combined
-    if all_keywords:
-        seg = " OR ".join(all_keywords)
-        text_resp = await client.search_text(
-            text_query=seg,
-            center=center,
-            radius_meters=req.radiusMeters,
-            max_result_count=min(15, max_results),
-        )
-        for r in text_resp.results:
-            existing = results_by_id.get(r.placeId)
-            # Heuristic tagging: if primaryType maps to any includedTypes we set labels, otherwise leave empty.
-            labels = []
-            if r.primaryType and r.primaryType in pack_labels_by_type:
-                labels = pack_labels_by_type.get(r.primaryType, [])
-            elif r.types:
-                lbl_set = set()
-                for tp in r.types:
-                    for lbl in pack_labels_by_type.get(tp, []):
-                        lbl_set.add(lbl)
-                labels = sorted(lbl_set)
-            if existing:
-                for lbl in labels:
-                    if lbl not in (existing.categories or []):
-                        existing.categories.append(lbl)
-            else:
-                r.categories = labels
-                results_by_id[r.placeId] = r
-        if text_resp.next_page_token:
-            next_text_token = text_resp.next_page_token
+            if pack.keywords:
+                seg = " OR ".join(pack.keywords)
+                text_resp = await client.search_text(
+                    text_query=seg,
+                    center=center,
+                    radius_meters=req.radiusMeters,
+                    max_result_count=min(20, max_results),
+                )
+                for r in text_resp.results:
+                    existing = results_by_id.get(r.placeId)
+                    if existing:
+                        if pack_label not in (existing.categories or []):
+                            existing.categories.append(pack_label)
+                    else:
+                        r.categories = [pack_label]
+                        results_by_id[r.placeId] = r
+                if text_resp.next_page_token:
+                    paginate_queue.append((text_resp.next_page_token, pack_label))
 
-    # Recall boost remains optional; only run if explicitly requested
+    # Recall boost: If auto-repair related packs are selected and highRecall is on, run an extra targeted text search and merge
     try:
         AUTO_RECALL_KEYS = {
             "auto_traditional",  # general auto repair
@@ -314,7 +478,7 @@ async def search_places(req: SearchRequest) -> SearchResponse:
                 text_query=boost_query,
                 center=center,
                 radius_meters=req.radiusMeters,
-                max_result_count=min(10, max_results),
+                max_result_count=min(20, max_results),
             )
             for r in boost_resp.results:
                 existing = results_by_id.get(r.placeId)
@@ -325,12 +489,37 @@ async def search_places(req: SearchRequest) -> SearchResponse:
                 else:
                     r.categories = ["TRADITIONAL AUTO"]
                     results_by_id[r.placeId] = r
-            # For simplicity, do not propagate boost pagination to reduce costs
+            if boost_resp.next_page_token:
+                paginate_queue.append((boost_resp.next_page_token, "TRADITIONAL AUTO"))
     except Exception:
         # Boost is best-effort; do not fail the request if it errors
         pass
 
-    # No server-side auto-pagination; leave to client 'Load More'
+    # High-recall pagination: fetch additional pages round-robin across all queued next_page_tokens
+    if req.highRecall and paginate_queue:
+        try:
+            # Round-robin until max_results or tokens exhausted
+            idx = 0
+            while len(results_by_id) < max_results and paginate_queue:
+                token, label = paginate_queue.pop(0)
+                try:
+                    page = await client.fetch_next_page(next_page_token=token)
+                except Exception:
+                    continue
+                for r in page.results:
+                    existing = results_by_id.get(r.placeId)
+                    if existing:
+                        if label and label not in (existing.categories or []):
+                            existing.categories.append(label)
+                    else:
+                        r.categories = [label] if label else []
+                        results_by_id[r.placeId] = r
+                if page.next_page_token:
+                    paginate_queue.append((page.next_page_token, label))
+                idx = (idx + 1) % (len(paginate_queue) or 1)
+        except Exception:
+            # Don't fail the request if pagination fails
+            pass
 
     merged_list = list(results_by_id.values())
 
@@ -351,30 +540,18 @@ async def search_places(req: SearchRequest) -> SearchResponse:
     # Truncate to max_results
     filtered = filtered[:max_results]
 
-    # Expose a composite nextPageToken encoding origin to prevent double-tries. Prefer Nearby token, else Text token.
-    next_token = None
-    if next_nearby_token:
-        next_token = _encode_next_token("n", next_nearby_token)
-    elif next_text_token:
-        next_token = _encode_next_token("t", next_text_token)
+    # For compatibility, still expose the first available token if any
+    next_token = paginate_queue[0][0] if paginate_queue else None
 
     resp = SearchResponse(results=filtered, nextPageToken=next_token, centerLat=center_lat, centerLng=center_lng)
 
     # Store in cache
     _cache_set(cache_key, {"results": resp.results, "nextPageToken": resp.nextPageToken})
 
-    headers = {
-        "X-Cache": "MISS",
-        "X-Places-Search-Nearby": str(client.metrics.get("search_nearby_calls", 0)),
-        "X-Places-Search-Text": str(client.metrics.get("search_text_calls", 0)),
-        "X-Places-Details": str(client.metrics.get("details_calls", 0)),
-        "X-Places-Center-Cache-Hits": str(client.metrics.get("center_cache_hits", 0)),
-        "X-Places-Center-Cache-Misses": str(client.metrics.get("center_cache_misses", 0)),
-    }
-    return JSONResponse(content=resp.model_dump(), headers=headers)
+    return resp
 
 @app.get("/search/places/next", response_model=SearchResponse)
-async def search_places_next(token: str = Query(..., description="Composite nextPageToken returned from /search/places")) -> SearchResponse:
+async def search_places_next(token: str = Query(..., description="Upstream Places API nextPageToken")) -> SearchResponse:
     reload_categories()
     if not PLACES_API_KEY:
         raise HTTPException(status_code=500, detail="PLACES_API_KEY not configured")
@@ -382,21 +559,12 @@ async def search_places_next(token: str = Query(..., description="Composite next
     client = PlacesClient(api_key=PLACES_API_KEY, field_mask=FIELD_MASK)
 
     try:
-        origin, upstream = _decode_next_token(token)
-        origin_name = "text" if origin == "t" else "nearby"
-        resp = await client.fetch_next_page(origin=origin_name, next_page_token=upstream)
+        resp = await client.fetch_next_page(next_page_token=token)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # Return composite token again if present
-    composite = None
-    if resp.next_page_token:
-        composite = _encode_next_token("t" if origin_name == "text" else "n", resp.next_page_token)
-    headers = {
-        "X-Places-Search-Nearby": str(client.metrics.get("search_nearby_calls", 0)),
-        "X-Places-Search-Text": str(client.metrics.get("search_text_calls", 0)),
-    }
-    return JSONResponse(content=SearchResponse(results=resp.results, nextPageToken=composite).model_dump(), headers=headers)
+    # No filtering or merging on next page alone; just pass through and let client apply filters client-side if needed
+    return SearchResponse(results=resp.results, nextPageToken=resp.next_page_token)
 
 # New: Categories endpoint for frontend selector
 @app.get("/categories")
@@ -483,17 +651,18 @@ async def places_details(payload: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for pid in ids:
         try:
-            data = await client.get_place_details(pid)
+            cached = _details_cache_get(pid)
+            if cached is not None:
+                data = cached
+            else:
+                data = await client.get_place_details(pid)
+                _details_cache_set(pid, data)
             out[pid] = {
                 "phone": data.get("nationalPhoneNumber") or data.get("internationalPhoneNumber"),
-                "website": data.get("websiteUri"),
             }
         except Exception:
-            out[pid] = {"phone": None, "website": None}
-    headers = {
-        "X-Places-Details": str(client.metrics.get("details_calls", 0))
-    }
-    return JSONResponse(content={"details": out}, headers=headers)
+            out[pid] = {"phone": None}
+    return {"details": out}
 
 # Static frontend serving (app/web)
 WEB_DIR = os.path.join(os.path.dirname(__file__), "web")

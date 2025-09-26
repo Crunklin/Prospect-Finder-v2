@@ -41,22 +41,11 @@ class PlacesClient:
         self.api_key = api_key
         self.field_mask = field_mask
         self._client = httpx.AsyncClient(timeout=20.0)
-        # Simple in-memory cache for center text -> lat/lng with TTL
-        self._center_cache: Dict[str, Dict[str, Any]] = {}
-        self._center_cache_ttl_seconds = 60 * 30  # 30 minutes
-        # Lightweight metrics
-        self.metrics: Dict[str, int] = {
-            "search_text_calls": 0,
-            "search_nearby_calls": 0,
-            "details_calls": 0,
-            "center_cache_hits": 0,
-            "center_cache_misses": 0,
-        }
 
-    async def _post(self, path: str, json_body: Dict[str, Any], *, field_mask: Optional[str] = None) -> Dict[str, Any]:
+    async def _post(self, path: str, json_body: Dict[str, Any]) -> Dict[str, Any]:
         headers = {
             "X-Goog-Api-Key": self.api_key,
-            "X-Goog-FieldMask": field_mask or self.field_mask,
+            "X-Goog-FieldMask": self.field_mask,
             "Content-Type": "application/json",
         }
         url = f"{PLACES_BASE}/{path}"
@@ -95,7 +84,6 @@ class PlacesClient:
                 }
             },
         }
-        self.metrics["search_nearby_calls"] += 1
         data = await self._post("places:searchNearby", body)
         places = data.get("places", [])
         next_token = data.get("nextPageToken") or data.get("next_page_token")
@@ -134,57 +122,38 @@ class PlacesClient:
         # The API caps results per page; maxResultCount can be included for Text as well
         body["maxResultCount"] = max_result_count
 
-        self.metrics["search_text_calls"] += 1
         data = await self._post("places:searchText", body)
         places = data.get("places", [])
         next_token = data.get("nextPageToken") or data.get("next_page_token")
         results = [_map_place_to_lite(p) for p in places]
         return ClientSearchResponse(results=results, next_page_token=next_token)
 
-    async def fetch_next_page(self, origin: str, next_page_token: str) -> ClientSearchResponse:
-        """Fetch next page for a known origin ('text' or 'nearby') without double-trying."""
-        if origin not in ("text", "nearby"):
-            raise ValueError("origin must be 'text' or 'nearby'")
-        path = "places:searchText" if origin == "text" else "places:searchNearby"
-        if origin == "text":
-            self.metrics["search_text_calls"] += 1
-        else:
-            self.metrics["search_nearby_calls"] += 1
-        data = await self._post(path, {"pageToken": next_page_token})
-        places = data.get("places", [])
-        next_token = data.get("nextPageToken") or data.get("next_page_token")
-        results = [_map_place_to_lite(p) for p in places]
-        return ClientSearchResponse(results=results, next_page_token=next_token)
+    async def fetch_next_page(self, next_page_token: str) -> ClientSearchResponse:
+        # Next page for both Nearby and Text uses places:search* with pageToken
+        # We can't know which one produced it. We'll try text search endpoint first; if it fails, try nearby.
+        for path in ("places:searchText", "places:searchNearby"):
+            try:
+                data = await self._post(path, {"pageToken": next_page_token})
+                places = data.get("places", [])
+                next_token = data.get("nextPageToken") or data.get("next_page_token")
+                results = [_map_place_to_lite(p) for p in places]
+                return ClientSearchResponse(results=results, next_page_token=next_token)
+            except httpx.HTTPStatusError:
+                continue
+        raise ValueError("Invalid or expired nextPageToken")
 
     async def _resolve_center_text(self, text: str) -> Dict[str, float]:
-        """Resolve free-form text to lat/lng using minimal field mask and a short-lived cache."""
-        key = text.strip()
-        if not key:
-            raise ValueError("center text is empty")
-        import time
-        now = time.time()
-        cached = self._center_cache.get(key)
-        if cached and (now - cached.get("ts", 0) < self._center_cache_ttl_seconds):
-            self.metrics["center_cache_hits"] += 1
-            return {"latitude": cached["lat"], "longitude": cached["lng"]}
-
+        # Use Text Search to resolve center text to a lat/lng by searching for the text and taking the first result's location.
         body = {
             "textQuery": text,
             "maxResultCount": 1,
         }
-        # Request only the minimal field(s) needed
-        self.metrics["center_cache_misses"] += 1
-        self.metrics["search_text_calls"] += 1
-        data = await self._post("places:searchText", body, field_mask="places.location")
+        data = await self._post("places:searchText", body)
         places = data.get("places", [])
         if not places:
             raise ValueError("Unable to resolve center text to location")
         loc = places[0].get("location", {})
-        lat, lng = loc.get("latitude"), loc.get("longitude")
-        if lat is None or lng is None:
-            raise ValueError("Resolved place has no location")
-        self._center_cache[key] = {"lat": lat, "lng": lng, "ts": now}
-        return {"latitude": lat, "longitude": lng}
+        return {"latitude": loc.get("latitude"), "longitude": loc.get("longitude")}
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -205,10 +174,9 @@ class PlacesClient:
         headers = {
             "X-Goog-Api-Key": self.api_key,
             # Dedicated field mask for details
-            "X-Goog-FieldMask": "id,nationalPhoneNumber,internationalPhoneNumber,websiteUri",
+            "X-Goog-FieldMask": "id,nationalPhoneNumber,internationalPhoneNumber",
         }
         url = f"{PLACES_BASE}/places/{place_id}"
-        self.metrics["details_calls"] += 1
         resp = await self._client.get(url, headers=headers)
         if resp.status_code >= 400:
             try:
