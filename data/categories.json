@@ -1,0 +1,200 @@
+[
+  {
+    "key": "auto_traditional",
+    "label": "Traditional Auto Repair",
+    "includedTypes": ["car_repair"],
+    "keywords": [
+      "auto repair",
+      "mechanic",
+      "auto service",
+      "car service",
+      "brake repair",
+      "muffler",
+      "exhaust",
+      "transmission repair",
+      "oil change",
+      "engine repair",
+      "tune up",
+      "diagnostic",
+      "tire repair",
+      "alignment",
+      "suspension",
+      "struts",
+      "shocks",
+      "radiator",
+      "alternator",
+      "starter",
+      "battery service"
+    ],
+    "strategy": "hybrid"
+  },
+  {
+    "key": "quick_lube",
+    "label": "Quick Lube / Oil Change",
+    "includedTypes": ["car_repair"],
+    "keywords": [
+      "oil change",
+      "quick lube",
+      "lube express",
+      "oil & lube",
+      "full service oil change"
+    ],
+    "strategy": "hybrid"
+  },
+  {
+    "key": "tire_shops",
+    "label": "Tire Shops",
+    "includedTypes": ["car_repair"],
+    "keywords": [
+      "tire shop",
+      "tires",
+      "tire center",
+      "tire warehouse",
+      "tire repair",
+      "flat repair",
+      "wheel alignment"
+    ],
+    "strategy": "hybrid"
+  },
+  {
+    "key": "auto_glass",
+    "label": "Auto Glass",
+    "includedTypes": ["car_repair"],
+    "keywords": [
+      "auto glass",
+      "windshield",
+      "windshield repair",
+      "windshield replacement"
+    ],
+    "strategy": "hybrid"
+  },
+  {
+    "key": "body_collision",
+    "label": "Body & Collision",
+    "includedTypes": [],
+    "keywords": [
+      "auto body",
+      "auto body shop",
+      "collision center",
+      "collision repair",
+      "body shop",
+      "paint & body",
+      "auto paint"
+    ],
+    "strategy": "text"
+  },
+  {
+    "key": "car_wash",
+    "label": "Car Wash / Detailing",
+    "includedTypes": ["car_wash"],
+    "keywords": ["detail", "detailing"],
+    "strategy": "hybrid"
+  },
+  {
+    "key": "towing",
+    "label": "Towing Services",
+    "includedTypes": [],
+    "keywords": ["towing service", "wrecker", "tow truck"],
+    "strategy": "text"
+  },
+  {
+    "key": "dealers",
+    "label": "Dealers (New/Used)",
+    "includedTypes": ["car_dealer"],
+    "keywords": ["used car dealer", "pre-owned"],
+    "strategy": "hybrid"
+  },
+
+  {"key": "plumbers", "label": "Plumbers", "includedTypes": ["plumber"], "keywords": [], "strategy": "nearby"},
+  {"key": "electricians", "label": "Electricians", "includedTypes": ["electrician"], "keywords": [], "strategy": "nearby"},
+  {"key": "roofing", "label": "Roofing Contractors", "includedTypes": ["roofing_contractor"], "keywords": [], "strategy": "nearby"},
+  {"key": "hvac", "label": "HVAC (Heating & Cooling)", "includedTypes": [], "keywords": ["hvac", "heating and cooling", "furnace", "air conditioning contractor"], "strategy": "text"},
+  {"key": "pest_control", "label": "Pest Control", "includedTypes": [], "keywords": ["pest control", "exterminator"], "strategy": "text"},
+  {"key": "locksmiths", "label": "Locksmiths", "includedTypes": ["locksmith"], "keywords": [], "strategy": "nearby"},
+  {"key": "landscaping", "label": "Landscaping / Lawn Care", "includedTypes": [], "keywords": ["landscaping", "landscape contractor", "lawn care", "lawn service"], "strategy": "text"},
+  {"key": "tree_service", "label": "Tree Service", "includedTypes": [], "keywords": ["tree service", "tree removal", "arborist"], "strategy": "text"},
+  {"key": "painting", "label": "Painting Contractors", "includedTypes": ["painter"], "keywords": [], "strategy": "nearby"},
+
+  {"key": "moving", "label": "Moving Companies", "includedTypes": ["moving_company"], "keywords": [], "strategy": "nearby"},
+  {"key": "courier", "label": "Courier / Delivery Services", "includedTypes": [], "keywords": ["courier service", "delivery service", "parcel delivery"], "strategy": "text"},
+  {"key": "rental_fleets", "label": "Rental Fleets", "includedTypes": ["car_rental"], "keywords": [], "strategy": "nearby"},
+
+  {"key": "hardware_supply", "label": "Hardware & Building Supply (B2B)", "includedTypes": ["hardware_store"], "keywords": ["building supply", "contractor supply"], "strategy": "hybrid"},
+  {"key": "waste_dumpster", "label": "Waste / Dumpster / Junk", "includedTypes": [], "keywords": ["dumpster rental", "waste management", "junk removal", "roll-off"], "strategy": "text"},
+  {"key": "excavate_pave_concrete", "label": "Excavating / Paving / Concrete", "includedTypes": [], "keywords": ["excavating contractor", "asphalt paving", "concrete contractor"], "strategy": "text"}
+  ,
+  {"key": "mobile_mechanics", "label": "Mobile Mechanics / Roadside", "includedTypes": [], "keywords": ["mobile mechanic", "roadside repair", "roadside assistance mechanic", "on site mechanic", "fleet mobile repair"], "strategy": "text"},
+  {"key": "diesel_truck_repair", "label": "Diesel & Truck Repair (Fleet)", "includedTypes": [], "keywords": ["diesel repair", "truck repair", "fleet repair", "truck service center", "semi truck repair"], "strategy": "text"},
+  {"key": "fleet_washing", "label": "Fleet Washing (On-Site)", "includedTypes": [], "keywords": ["fleet washing", "truck washing service", "mobile truck wash", "power washing trucks"], "strategy": "text"},
+  {"key": "vehicle_wraps", "label": "Vehicle Wraps / Graphics", "includedTypes": [], "keywords": ["vehicle wrap", "fleet graphics", "vehicle graphics", "car wrap", "truck wrap"], "strategy": "text"},
+  {"key": "upfitters", "label": "Vehicle Upfitters / Outfitters", "includedTypes": [], "keywords": ["truck upfitter", "van upfit", "ladder rack install", "work van shelving", "commercial vehicle upfit"], "strategy": "text"},
+  {"key": "auto_parts_b2b", "label": "Auto Parts Wholesale / Distribution", "includedTypes": [], "keywords": ["auto parts wholesale", "auto parts distributor", "aftermarket parts distributor", "fleet parts supplier"], "strategy": "text"},
+  {"key": "tint_ppf", "label": "Window Tint / Paint Protection Film", "includedTypes": [], "keywords": ["window tint", "commercial window tint", "paint protection film", "ppf installer"], "strategy": "text"},
+  {"key": "onsite_fueling", "label": "On-Site Fueling / Fuel Delivery", "includedTypes": [], "keywords": ["mobile fuel", "on site fueling", "fleet fueling service", "diesel delivery"], "strategy": "text"},
+
+  {"key": "trucking_companies", "label": "Trucking Companies / Carriers", "includedTypes": [], "keywords": ["trucking company", "freight carrier", "logistics carrier", "flatbed trucking", "ltl carrier"], "strategy": "text"},
+  {"key": "charter_bus", "label": "Charter Bus & Coach", "includedTypes": [], "keywords": ["charter bus", "coach lines", "motorcoach", "bus charter"], "strategy": "text"},
+  {"key": "shuttle_transport", "label": "Shuttle / Transport Services", "includedTypes": [], "keywords": ["airport shuttle", "employee shuttle", "corporate shuttle", "non emergency medical transport"], "strategy": "text"},
+
+  {"key": "garage_doors", "label": "Garage Door Companies", "includedTypes": [], "keywords": ["garage door service", "garage door installer", "overhead door"], "strategy": "text"},
+  {"key": "gutters", "label": "Gutters (Install/Clean)", "includedTypes": [], "keywords": ["gutter installation", "gutter cleaning", "seamless gutters"], "strategy": "text"},
+  {"key": "fencing", "label": "Fencing Contractors", "includedTypes": [], "keywords": ["fence contractor", "fence company", "fence installer"], "strategy": "text"},
+  {"key": "pool_service", "label": "Pool Service / Maintenance", "includedTypes": [], "keywords": ["pool service", "pool maintenance", "pool cleaning"], "strategy": "text"},
+  {"key": "septic", "label": "Septic Services", "includedTypes": [], "keywords": ["septic service", "septic pumping", "septic tank cleaning"], "strategy": "text"},
+  {"key": "irrigation", "label": "Irrigation / Sprinklers", "includedTypes": [], "keywords": ["irrigation contractor", "sprinkler repair", "sprinkler install"], "strategy": "text"},
+  {"key": "solar_install", "label": "Solar Installers", "includedTypes": [], "keywords": ["solar installer", "solar company", "solar energy contractor"], "strategy": "text"},
+
+  {"key": "equipment_rental", "label": "Equipment Rental", "includedTypes": [], "keywords": [
+    "equipment rental",
+    "equipment rentals",
+    "equipment company",
+    "equipment dealer",
+    "construction equipment",
+    "forklift rental",
+    "forklift dealer",
+    "forklift service",
+    "scissor lift rental",
+    "boom lift rental",
+    "telehandler rental",
+    "Alta Equipment",
+    "United Rentals",
+    "Sunbelt Rentals",
+    "Herc Rentals"
+  ], "strategy": "text"},
+  {"key": "forklift_service", "label": "Forklift Service & Repair", "includedTypes": [], "keywords": ["forklift repair", "material handling service", "forklift maintenance"], "strategy": "text"},
+  {"key": "portable_toilets", "label": "Portable Toilets / Sanitation", "includedTypes": [], "keywords": ["porta potty rental", "portable restroom rental", "portable sanitation"], "strategy": "text"},
+  {"key": "storage_containers", "label": "Storage Container / Mobile Office", "includedTypes": [], "keywords": ["storage container rental", "mobile office rental", "shipping container rental"], "strategy": "text"},
+  {"key": "line_strip_marking", "label": "Line Striping / Pavement Marking", "includedTypes": [], "keywords": ["parking lot striping", "pavement marking", "line striping"], "strategy": "text"},
+  {"key": "snow_removal", "label": "Snow & Ice Removal", "includedTypes": [], "keywords": ["snow removal", "snow plowing", "commercial snow"], "strategy": "text"},
+  {"key": "sand_gravel_delivery", "label": "Sand & Gravel Delivery", "includedTypes": [], "keywords": ["sand delivery", "gravel delivery", "aggregate delivery"], "strategy": "text"},
+  {"key": "crane_services", "label": "Crane Services", "includedTypes": [], "keywords": ["crane service", "crane rental with operator", "mobile crane"], "strategy": "text"},
+  {"key": "mobile_welding", "label": "Mobile Welding / Fabrication", "includedTypes": [], "keywords": ["mobile welding", "welding service", "on site welding"], "strategy": "text"}
+  ,
+  {"key": "golf_courses", "label": "Golf Courses", "includedTypes": ["golf_course"], "keywords": ["golf club", "country club"], "strategy": "hybrid"},
+  {"key": "campgrounds", "label": "Campgrounds", "includedTypes": ["campground"], "keywords": ["rv park", "camp site", "state park campground"], "strategy": "hybrid"},
+  {"key": "marinas", "label": "Marinas", "includedTypes": ["marina"], "keywords": ["boat dock", "boat storage", "harbor marina"], "strategy": "hybrid"}
+  ,
+  {"key": "marina_services", "label": "Marina Services", "includedTypes": [], "keywords": ["marina services", "dock repair", "dock maintenance", "boat slips", "fuel dock", "pump-out station"], "strategy": "text"},
+  {"key": "boat_repair", "label": "Boat Repair", "includedTypes": [], "keywords": ["boat repair", "marine repair", "outboard repair", "inboard repair", "fiberglass repair", "boat mechanic"], "strategy": "text"}
+  ,
+  {"key": "powersports_dealers", "label": "Powersports Dealers", "includedTypes": [], "keywords": [
+    "powersports dealer",
+    "atv dealer",
+    "utv dealer",
+    "side by side dealer",
+    "snowmobile dealer",
+    "jet ski dealer",
+    "pwc dealer",
+    "dirt bike dealer"
+  ], "strategy": "text"},
+  {"key": "powersports_repair", "label": "Powersports Repair", "includedTypes": [], "keywords": [
+    "powersports repair",
+    "atv repair",
+    "utv repair",
+    "snowmobile repair",
+    "jet ski repair",
+    "pwc repair",
+    "dirt bike repair",
+    "motorcycle service"
+  ], "strategy": "text"}
+]
