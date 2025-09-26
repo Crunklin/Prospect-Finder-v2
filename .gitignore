@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+node_modules/
+*.log
+deploy.py
+*.exe
+*.dll
+*.so
+*.dylib
