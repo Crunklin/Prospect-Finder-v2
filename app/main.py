@@ -207,8 +207,12 @@ def _cache_get(key: Tuple[float, float, int, Tuple[str, ...], bool]) -> Optional
         "lat": key[0], "lng": key[1], "radius": key[2], "cats": list(key[3]), "hr": key[4]
     }, sort_keys=True)
     disk_val = _disk_cache_get("search", disk_key, _CACHE_TTL_SECONDS)
-    if disk_val is not None:
-        return disk_val
+    try:
+        if disk_val is not None:
+            return disk_val
+    except Exception:
+        # Fail-open on any disk cache error
+        return None
     return None
 
 def _cache_set(key: Tuple[float, float, int, Tuple[str, ...], bool], value: Dict[str, Any]) -> None:
@@ -218,7 +222,27 @@ def _cache_set(key: Tuple[float, float, int, Tuple[str, ...], bool], value: Dict
     disk_key = json.dumps({
         "lat": key[0], "lng": key[1], "radius": key[2], "cats": list(key[3]), "hr": key[4]
     }, sort_keys=True)
-    _disk_cache_set("search", disk_key, value)
+    # Serialize results to plain dicts for JSON
+    results = value.get("results") or []
+    serialized_results: List[Dict[str, Any]] = []
+    for r in results:
+        if hasattr(r, "model_dump"):
+            serialized_results.append(r.model_dump())
+        elif hasattr(r, "dict"):
+            serialized_results.append(r.dict())
+        elif isinstance(r, dict):
+            serialized_results.append(r)
+        else:
+            try:
+                serialized_results.append(dict(r))
+            except Exception:
+                continue
+    disk_value = {"results": serialized_results, "nextPageToken": value.get("nextPageToken")}
+    try:
+        _disk_cache_set("search", disk_key, disk_value)
+    except Exception:
+        # Fail-open if disk cache write fails
+        pass
 
 def _center_cache_get(text: str) -> Optional[Dict[str, float]]:
     import time
@@ -227,9 +251,12 @@ def _center_cache_get(text: str) -> Optional[Dict[str, float]]:
     entry = _CENTER_CACHE.get(key_norm)
     if not entry:
         # Try disk cache
-        disk_val = _disk_cache_get("center", key_norm, _CENTER_TTL_SECONDS)
-        if disk_val and "latitude" in disk_val and "longitude" in disk_val:
-            return disk_val
+        try:
+            disk_val = _disk_cache_get("center", key_norm, _CENTER_TTL_SECONDS)
+            if disk_val and "latitude" in disk_val and "longitude" in disk_val:
+                return disk_val
+        except Exception:
+            return None
         return None
     ts, val = entry
     if now - ts > _CENTER_TTL_SECONDS:
@@ -243,7 +270,10 @@ def _center_cache_set(text: str, lat: float, lng: float) -> None:
     key = text.strip().lower()
     val = {"latitude": lat, "longitude": lng}
     _CENTER_CACHE[key] = (time.time(), val)
-    _disk_cache_set("center", key, val)
+    try:
+        _disk_cache_set("center", key, val)
+    except Exception:
+        pass
 
 def _details_cache_get(place_id: str) -> Optional[Dict[str, Any]]:
     import time
@@ -251,9 +281,12 @@ def _details_cache_get(place_id: str) -> Optional[Dict[str, Any]]:
     entry = _DETAILS_CACHE.get(place_id)
     if not entry:
         # Try disk cache
-        disk_val = _disk_cache_get("details", place_id, _DETAILS_TTL_SECONDS)
-        if disk_val:
-            return disk_val
+        try:
+            disk_val = _disk_cache_get("details", place_id, _DETAILS_TTL_SECONDS)
+            if disk_val:
+                return disk_val
+        except Exception:
+            return None
         return None
     ts, val = entry
     if now - ts > _DETAILS_TTL_SECONDS:
@@ -264,7 +297,10 @@ def _details_cache_get(place_id: str) -> Optional[Dict[str, Any]]:
 def _details_cache_set(place_id: str, data: Dict[str, Any]) -> None:
     import time
     _DETAILS_CACHE[place_id] = (time.time(), data)
-    _disk_cache_set("details", place_id, data)
+    try:
+        _disk_cache_set("details", place_id, data)
+    except Exception:
+        pass
 
 @app.get("/health")
 def health() -> Dict[str, str]:
