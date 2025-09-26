@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Fleet Prospect Finder</title>
+  
+  <!-- Load Leaflet from CDN with SRI -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.min.css" 
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" 
+        crossorigin="anonymous" />
+  
+  <!-- Load custom styles -->
+  <link rel="stylesheet" href="/static/styles.css" />
+  
+  <!-- Preconnect to CDN for faster loading -->
+  <link rel="preconnect" href="https://cdn.jsdelivr.net">
+  <link rel="dns-prefetch" href="https://cdn.jsdelivr.net">
+</head>
+<body>
+  <header>
+    <h1>Fleet Prospect Finder</h1>
+  </header>
+
+  <main>
+    <section class="top-layout">
+      <aside class="sidebar">
+        <div class="field">
+          <label for="centerText">Area (address, city, or place)</label>
+          <input id="centerText" type="text" placeholder="e.g., Detroit, MI" />
+        </div>
+        <div class="row">
+          <div class="field">
+            <label for="radius">Radius (miles)</label>
+            <input id="radius" type="number" min="0.1" max="30" step="0.1" value="5" />
+          </div>
+          <div class="field checkbox">
+            <label><input id="excludeSAB" type="checkbox" checked /> Exclude service-area-only</label>
+          </div>
+        </div>
+        <div class="field">
+          <label for="categories">Categories</label>
+          <div class="cat-controls">
+            <button id="catSelectAll">Select All</button>
+            <button id="catSelectNone">Select None</button>
+          </div>
+          <div id="categories" class="categories chips-inline"></div>
+        </div>
+      </aside>
+      <div class="map-wrap">
+        <div id="map"></div>
+        <div class="map-actions">
+          <button id="toggleSidebarBtn" aria-label="Toggle sidebar">Toggle Sidebar</button>
+          <button id="searchBtn">Search</button>
+          <button id="refreshBtn" title="Force refresh (bypass cache)">⟳</button>
+          <button id="loadMoreBtn" disabled>Load More</button>
+          <button id="drawRadiusBtn" title="Click to place the radius">Draw Radius</button>
+          <button id="clearRadiusBtn" title="Remove the radius">Clear Radius</button>
+          <button id="resetFiltersBtn" title="Reset all filters">Reset Filters</button>
+          <button id="densityToggleBtn" title="Toggle compact view">Compact</button>
+          <label class="sm" title="Enable deeper pagination and recall boosts" style="display:inline-flex;align-items:center;gap:6px;margin-left:8px;">
+            <input type="checkbox" id="highRecallToggle" checked> High Recall
+          </label>
+          <span id="drawStatus" class="muted"></span>
+        </div>
+        <section class="results panel">
+          <div class="results-header">
+            <div><strong>Search Results</strong> · <span id="resultsCount">0</span> businesses found</div>
+            <div class="header-actions">
+              <button id="exportCsvBtn" disabled>Export CSV</button>
+            </div>
+          </div>
+          <div class="type-filters">
+            <div class="type-filter-actions">
+              <span>Types<span id="typesCount" class="muted"></span>:</span>
+              <button id="typesSelectAll" class="sm">All</button>
+              <button id="typesSelectNone" class="sm">None</button>
+            </div>
+            <div id="typeChips" class="chips"></div>
+          </div>
+          <div id="tableHeader" class="table-header card card-row">
+            <div class="cell name" data-sort="name">Business Name</div>
+            <div class="cell category" data-sort="category">Category</div>
+            <div class="cell addr" data-sort="address">Address</div>
+            <div class="cell city" data-sort="city">City</div>
+            <div class="cell state" data-sort="state">State</div>
+            <div class="cell zip" data-sort="zip">ZIP</div>
+            <div class="cell distance" data-sort="distance">Distance</div>
+          </div>
+          <div class="filter-row card card-row">
+            <div class="cell name"></div>
+            <div class="cell category">
+              <div class="pack-filter-actions">
+                <span>Packs<span id="packsCount" class="muted"></span>:</span>
+                <button id="packsSelectAll" class="sm">All</button>
+                <button id="packsSelectNone" class="sm">None</button>
+              </div>
+              <div id="packChips" class="chips"></div>
+            </div>
+            <div class="cell addr"></div>
+            <div class="cell city"></div>
+            <div class="cell state"></div>
+            <div class="cell zip"></div>
+            <div class="cell distance"></div>
+          </div>
+          <div id="resultsList" class="list"></div>
+        </section>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Load Leaflet from CDN with SRI -->
+  <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.min.js" 
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" 
+          crossorigin="anonymous"></script>
+  
+  <!-- Load main application script with cache-busting -->
+  <script>
+    // Add a cache-busting query parameter to the script URL
+    document.write(`<script src="/static/main.js?v=${new Date().getTime()}" defer><\/script>`);
+  </script>
+</body>
+</html>
